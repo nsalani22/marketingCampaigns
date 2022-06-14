@@ -1,0 +1,848 @@
+---
+title: 'Case Study: Client Response to Direct marketing campaigns'
+author: "Nicole Salani"
+date: '2022-06-07'
+output: html_document
+header-includes:
+- \usepackage[utf8]{inputenc}
+- \usepackage{amsmath}
+- \usepackage{amsmath,bm}
+- \usepackage{mathtools}
+- \usepackage{xcolor}
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+library(Hmisc)
+library(dplyr)
+library(tidyverse)
+library(ggplot2) # think its incl with tidyverse?
+library(viridis) # color blind colour scheme
+library(lattice)
+library(readr)
+library(kableExtra)
+library(flextable)
+#library(modelsummary) #masks gt escape latex; cautious of order
+library(mice)# for simulating missingness and missingness summary
+library(MASS)
+library(caret)
+library(nnet)
+library(ranger)
+library(mi) # multiple imputation
+library(VIM)
+library(NHANES)
+library(naniar)
+library(caTools)
+library(e1071)
+library(glmnet)
+library(ROCR)
+# set theme for ggplot2 plots
+theme_set(theme_minimal())
+
+# use 5 cores and don't ask for user input when making plots
+options('mc.cores' = 4, "devAskNewPage"= FALSE, "verbose" = F)
+```
+
+## Introduction
+
+### Data
+
+ In this case study, we use the direct marketing campaigns data of a Portuguese banking institution. The marketing campaigns were based on phone calls. Often, more than one contact to the same client was required, in order to assess if the product (bank term deposit) would be ('yes') or not ('no') subscribed by the client. The **goal** is to predict if the client will subscribe to a term product (variable Y). This analysis is structured in the following way: (1) data preparation; then, (2) exploration;  (3) model selection; followed by, (4) a discussion of the results; and, finally (5) conclusion and next steps. 
+
+```{r import data, echo=FALSE, fig.align='center', warning=FALSE, message=FALSE}
+dat <- readr::read_csv("data/Case Study Data.csv")
+
+
+
+### Output variable (desired target):----------- 
+
+# 21 - y - has the client subscribed a term deposit? (binary: 'yes','no')
+dat[, 'y'] <- lapply(dat[, 'y'], factor, labels=c('no','yes'))
+
+### predictors -----------------
+
+### look at pdays without the 999 value 
+pdays_p <- dat %>% mutate(pdays = factor(pdays), y = factor(y)) %>% 
+  group_by(pdays, y) %>% 
+  dplyr::summarize(n = n()) %>% 
+  ggplot(aes(x=pdays, y =n, fill = y)) +
+  geom_bar(stat = "identity", position=position_dodge() ) +
+  ggtitle("Number of Days Since Last Contact from Previous Campaign ") +
+  xlab("Previous Days") + ylab("Count")
+
+
+pdays_p +
+   scale_fill_manual(values=c('black','lightgray')) + # perhaps try Reds? 
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+# let's convert pdays into a categorical variable
+dat <- dat %>% mutate(pdays.categ = case_when( pdays >= 0 & pdays < 999 ~ "0-27 pdays",
+                                         TRUE ~ "no pdays"
+                                         )) 
+
+### converted pdays to categorical variables to accommodate 999 value 
+pdays_p2 <- dat %>% mutate(pdays.categ = factor(pdays.categ), y = factor(y)) %>% 
+  group_by(pdays.categ, y) %>% 
+  dplyr::summarize(n = n()) %>% 
+  ggplot(aes(x=pdays.categ, y =n, fill = y)) +
+  geom_bar(stat = "identity", position=position_dodge() ) +
+  ggtitle("Number of Days Since Last Contact from Previous Campaign ") +
+  xlab("Previous Days") + ylab("Count")
+
+pdays_p2 +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+# categorical vars
+# will consolidate the categorical vars with more than 5 unique classes 
+
+
+val_repl <- c("unknown")  # Specify values to be replaced
+col_repl <- c("job", "marital", "education", "default", "housing", "loan") # Specify columns                 
+# Replace values in all columns
+dat[col_repl] <- sapply(dat[col_repl],function(x) replace(x, x %in% val_repl,"notKnown"))
+
+categ.vars <- c('job','marital', 'education',  'default', 'housing', 'loan','contact', 'month', 'day_of_week',  'pdays.categ', 'poutcome')
+dat[, categ.vars] <- lapply(dat[, categ.vars], as.factor)
+
+ 
+dat.missing <- dat %>% 
+  dplyr::select("age"            
+                ,"job"            
+                ,"marital"        
+                ,"education"      
+                ,"default"        
+                ,"housing"        
+                ,"loan"          
+                ,"contact"       
+                ,"month"          
+                ,"day_of_week"    
+                ,"duration"      
+                ,"campaign"       
+                ,"pdays.categ"        
+                ,"previous"      
+                ,"poutcome"       
+                ,"emp.var.rate"   
+                ,"cons.price.idx" 
+                ,"cons.conf.idx"  
+                ,"euribor3m"      
+                ,"nr.employed"    
+                ,"y")
+
+
+
+
+
+```
+             
+
+
+
+## Exploratory Data Analysis
+
+### Data Preparation: Multiple Imputation (MI)
+
+As shown below, there are two numerical variables with missing values, `age` and `consumer price index`. We **assume** that data are missing at random which means that if two observations had the same values for all their observed covariates we would expect them to be equally likely to have missing values on the others. We state this keeping in mind that this is an untestable assumption and is distinct from decisions about how to predict missing values.
+
+Following, we deal with the missingness of these two variable by using we multiple-imputation (MI) because: 
+
+* It allows us to use all available information
+* We can make weak (more plausible) assumptions about the missing data mechanism (noted above)
+* It properly reflects two kinds of uncertainty about the missing values (so, confidence intervals have correct coverage properties)
+
+    - Sampling uncertainty
+    - Model uncertainty
+    
+* It maintains relationships between variables
+* One set of imputed datasets can be used for many analyses (allowing for release, for example, of public use imputed datasets)
+
+```{r data summary, fig.align='center', echo=FALSE, warning=FALSE, message=FALSE}
+## Get number of missings per variable (n and %)
+summary_miss <- miss_summary(dat.missing, order = FALSE)
+
+# Pull out the missingness summary for each variable 
+missingSummary <- summary_miss$miss_var_summary[[1]] 
+
+# Add type of variable column : 6 integer and 9 string
+missingSummary <- missingSummary %>% mutate( 
+  class = c(# client specific
+            "numeric"       # "age"  [missing]
+            ,"categorical"  # ,"job"  
+            ,"categorical"  # ,"marital"
+            ,"categorical"  # ,"education"
+            ,"categorical"  # ,"default"  
+            ,"categorical"  #,"housing" 
+            ,"categorical"  #, "loan" 
+            ,"categorical"  # ,"contact" 
+            ,"categorical"  #,"month" 
+            ,"categorical"  #,"day_of_week" 
+            ,"numeric"      #,"duration" 
+            
+            # not client specific
+            ,"numeric"     #,"campaign" 
+            ,"categorical" #,"pdays"        
+            ,"numeric"     #,"previous"  
+            ,"categorical" #,"poutcome"
+            
+            # social and economic context attributes
+            ,"numeric"  #,"emp.var.rate"   
+            ,"numeric"  #,"cons.price.idx"  [missing]
+            ,"numeric"  #,"cons.conf.idx"  
+            ,"numeric"  #,"euribor3m"     
+            ,"numeric"  #,"nr.employed"  
+            ,"binary"   #, "y"  
+            ))
+  
+
+# Add row on total missing for the entire dataset
+missingSummary <- missingSummary %>% add_row(variable = "total.missing", 
+                                             n_miss = n_miss(dat.missing), 
+                                             pct_miss = summary_miss$miss_df_prop, 
+                                             class="tbl.df or data.frame")
+
+
+kable(missingSummary,padding = 4 , format = "markdown", caption = "Summary of Missingness", digits = 3)
+```
+
+
+```{r missing data frame, fig.align='center', message=FALSE, warning=FALSE, cache=TRUE}
+
+# Create a missing_data object, look at the data and the missing data patterns
+dat.multi <- dat.missing %>%
+   as.data.frame() %>%
+  missing_data.frame()
+
+
+# summary
+par(mfrow=c(1,2))
+#par(ask = F)
+
+# histograms of the observed variables that have missingness:
+hist(dat.multi)
+# visualize the pattern of missingness
+image(dat.multi)
+
+dat.multi <- mi::change(dat.multi,
+                        y = c('age',
+                              'cons.price.idx'),
+                        what = 'imputation_method',
+                        to = c('pmm', 'pmm')) 
+```
+
+
+#### Run MI and Obtain Complete Dataset
+
+```{r message=FALSE, warning=FALSE, fig.align='center', cache = TRUE}
+# 1.Run mi with 5 chains and 150 iterations -----
+dat.imputations <- mi::mi(dat.multi, n.chains = 5, n.iter = 150, max.minutes = 30, seed = 124, verbose = FALSE) 
+
+# 2.Check convergence -----
+converged <- mi2BUGS(dat.imputations) 
+
+# 3.obtain completed data from converged MI procedure
+dat.compl.1to5 <- complete(dat.imputations, m=5)
+
+#lapply(dat.comp.1to5, summary)
+
+# pick the first compete dataset to use for the rest of the analysis
+dat.compl <- dat.comp.1to5[[1]]
+
+dat.compl <- dat.compl %>% 
+   dplyr::select("age"            
+                ,"job"            
+                ,"marital"        
+                ,"education"      
+                ,"default"        
+                ,"housing"        
+                ,"loan"          
+                ,"contact"       
+                ,"month"          
+                ,"day_of_week"    
+                ,"campaign"       
+                ,"pdays.categ"        
+                ,"previous"      
+                ,"poutcome"       
+                ,"emp.var.rate"   
+                ,"cons.price.idx" 
+                ,"cons.conf.idx"  
+                ,"euribor3m"      
+                ,"nr.employed"    
+                ,"y")
+```
+
+
+### Client Specific Attributes and Subscription to a Term Deposit
+
+We can start evaluating the relationship between client attributes and the outcome variable, subscription to a term deposit, by looking at the some barplots.
+
+```{r eda plots client specific, fig.align='center', echo=FALSE, warning=FALSE, message=FALSE}
+
+## Age distribution: mode of distribution for both y classes is around 30ish
+age.p <- ggplot(dat.compl, aes(age, fill = y)) +
+  geom_histogram(alpha = 0.5, position = "identity")
+age.p
+
+## Job type
+job.p <- ggplot(dat.compl, aes(factor(job),fill = factor(y)))
+job.p  <- job.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Job Type") + ylab("Count")
+
+job.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## marital status
+marital.p <- ggplot(dat.compl, aes(factor(marital),fill = factor(y)))
+marital.p  <- marital.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Marital Status") + ylab("Count")
+
+marital.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## education
+edu.p <- ggplot(dat.compl, aes(factor(education),fill = factor(y)))
+edu.p  <- edu.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Education level") + ylab("Count")
+
+edu.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## default
+
+default.p <- ggplot(dat.compl, aes(factor(default),fill = factor(y)))
+default.p <- default.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Client has credit in default?") + ylab("Count")
+
+default.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## housing
+
+
+housing.p <- ggplot(dat.compl, aes(factor(housing),fill = factor(y)))
+housing.p <- housing.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Client has housing loan?") + ylab("Count")
+
+housing.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## loan
+loan.p <- ggplot(dat.compl, aes(factor(housing),fill = factor(y)))
+loan.p  <- loan.p   + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Client has personal loan?") + ylab("Count")
+
+loan.p  + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+### related with the last contact of the current campaign:
+
+#8 - contact: contact communication type (categorical: 'cellular','telephone') 
+contact.p <- ggplot(dat.compl, aes(factor(contact),fill = factor(y)))
+contact.p  <- contact.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Contact communication type") + ylab("Count")
+
+contact.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+#9 - month: last contact month of year (categorical: 'jan', 'feb', 'mar', ..., 'nov', 'dec') 
+
+month.p <- ggplot(dat.compl, aes(factor(month),fill = factor(y)))
+month.p  <- month.p + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Last contact month of year") + ylab("Count")
+
+month.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+# 10 - day_of_week: last contact day of the week (categorical: 'mon','tue','wed','thu','fri')
+
+day.p <- ggplot(dat.compl, aes(factor(day_of_week),fill = factor(y)))
+day.p  <- day.p + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Last contact day of the week") + ylab("Count")
+
+day.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+```
+
+
+
+### Non-Client Specific Attributes and Subscription to a Term Deposit
+
+
+```{r eda plots non client specific, fig.align='center', echo=FALSE, warning=FALSE, message=FALSE}
+
+## 12 - campaign: number of contacts performed during this campaign and for this client (numeric, includes last contact) 
+
+camp.p <- ggplot(dat.compl, aes(campaign, fill = y)) +
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Number of contacts performed during this campaign and for this client") + 
+  ylab("Count")
+camp.p
+
+## 13 - pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric; 999 means client was not previously contacted) 
+
+pdays.p <- ggplot(dat.compl, aes(factor(pdays.categ),fill = factor(y)))
+pdays.p  <- pdays.p   + geom_histogram(stat="count") +
+  ggtitle("") +
+  xlab("Number of days that passed by after the client was last contacted from a previous campaign") + 
+  ylab("Count")
+pdays.p  + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+
+## 14 - previous: number of contacts performed before this campaign and for this client (numeric) 
+
+prev.p <- ggplot(dat.compl, aes(previous,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Number of contacts performed during this campaign and for this client") + 
+  ylab("Count")
+
+prev.p
+
+## 15 - poutcome: outcome of the previous marketing campaign (categorical: 'failure','nonexistent','success')
+
+
+poutcome.p <- ggplot(dat.compl, aes(factor(poutcome),fill = factor(y)))
+poutcome.p  <- poutcome.p  + geom_histogram(stat="count", position = position_dodge()) +
+  ggtitle("") +
+  xlab("Outcome of the previous marketing campaign") + 
+  ylab("Count")
+poutcome.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+
+### social and economic context attributes ---
+
+## 16 - emp.var.rate: employment variation rate - quarterly indicator (numeric) 
+empvr.p <- ggplot(dat.compl, aes(emp.var.rate,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Employment variation rate") + 
+  ylab("Count")
+
+empvr.p 
+
+## 17 - cons.price.idx: consumer price index - monthly indicator (numeric) 
+
+cons.price.p <- ggplot(dat.compl, aes(cons.price.idx,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Consumer Price Index") + 
+  ylab("Count")
+
+cons.price.p
+
+## 18 - cons.conf.idx: consumer confidence index - monthly indicator (numeric) 
+
+cons.conf.p <- ggplot(dat.compl, aes(cons.conf.idx,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Consumer confidence index") + 
+  ylab("Count")
+
+cons.conf.p 
+
+## 19 - euribor3m: euribor 3 month rate - daily indicator (numeric) 
+
+euribor3m.p <- ggplot(dat.compl, aes(euribor3m,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("euribor 3 month rate") + 
+  ylab("Count")
+
+euribor3m.p  
+
+## 20 - nr.employed: number of employees - quarterly indicator (numeric)
+
+nr.employed.p <- ggplot(dat.compl, aes(nr.employed,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("number of employees") + 
+  ylab("Count")
+
+nr.employed.p
+
+```
+
+## Modelling
+
+(to be continued)
+
+```{r train test split}
+#randomly split data into training, test and validation
+set.seed(10001)
+#Splitting data
+split <- sample.split(dat.compl$y, SplitRatio = 0.70) 
+train <- subset(dat.compl, split == T) #ensure same proportion of clicks and non-clicks in both training and test sets to ensure balance
+test <- subset(dat.compl, split == F)
+```
+
+
+
+### 1. Logistic Regression
+
+```{r logistic regression}
+
+logistic_model <- glm(y == "yes" ~ ., data = train, family = binomial(link="logit"))
+summary(logistic_model)
+
+# compute the AUC of this model on test.
+test$predicted_probability_logit <- predict(logistic_model,newdata = test, type='response') 
+
+test.pred <- prediction(test$predicted_probability_logit, test$y)
+test.perf <- performance(test.pred, "auc")
+cat('the auc score for outcome on test data is ', 100*test.perf @y.values[[1]], "\n") #   
+ROC.perf <- performance(test.pred, "prec", "rec");
+plot (ROC.perf)
+```
+
+
+### 2. Random Forest
+Random forests are one of the best "off-the-shelf" prediction methods.  They are generally very accurate and easy to use out-of-box for classification. There is little parameter tuning required and more importantly, we can get an idea of feature importance.
+Since you generally don't need to prune the individual trees (and more trees usually doesn’t hurt), the main parameter to be tuned is the size of the
+random subset of predictors.
+
+However, bagging and random forests produce many trees. Two ways we can measure feature importance are:
+– For a feature, sum the decrease in Gini index over all splits in all trees where that feature was used.
+– For a feature, permute its values in the out-of-bag samples that are passed down each tree, then compute the average decrease in accuracy across all trees
+
+```{r random forest}
+
+# Fit a random forest model on train using the ranger package, predicting outcome Y as a function of client specific + non client specific + socio-economic attrubutes. Use 1000 trees, and make sure that both respect.unordered.factors and probability are TRUE, but other settings can have default values. 
+
+rforest_model <- ranger(y ~ age + job + marital + education + default + housing + loan + contact + month + day_of_week + campaign + pdays.categ + previous + poutcome + emp.var.rate + cons.price.idx + cons.conf.idx + euribor3m + nr.employed, data = train, num.trees =  1000, respect.unordered.factors = TRUE, probability = TRUE )
+
+
+# Compute the AUC of this model on test. 
+# In your written responses, write a sentence reporting how the AUC of the random forest compares with the AUC of the logistic regression model.
+
+# compute the AUC of this model on test.
+test$predicted_probability_rf <-  predict(rforest_model, data = test)$predictions[,2]
+
+
+test.pred_rf <- prediction(test$predicted_probability_rf, test$y)
+test.perf_rf <- performance(test.pred_rf, "auc")
+cat('the auc score for outcome on test data is ', 100*test.perf_rf@y.values[[1]], "\n") # 67.25898
+
+ROC.perf_rf <- performance(test.pred_rf, "prec", "rec");
+plot (ROC.perf_rf)
+```
+
+
+### Evaluation
+
+We evaluate the two models based on Area-Under-Curve (AUC) and Precision at K, where K represents the chosen threshold for converting probabilistic predictions to binary predictions ('yes' or 'no')
+
+
+```{r model comparison}
+
+# random forest model
+rforest <-  data.frame(predicted_probability_rf = predict(rforest_model,test,type="response")$predictions[,2],
+                       outcome_label = test$y)
+
+rforest <- rforest[order(rforest$predicted_probability_rf,decreasing=TRUE),]
+rforest$num_client <- 1:nrow(rforest)
+rforest$precision <- cumsum(rforest$outcome_label==1)/rforest$num_client
+rforest_plot <- rforest[which(rforest$num_client > 100),]
+
+
+
+# logistic regression model
+logreg <-  data.frame(predicted_probability_logit = predict(logistic_model,test,type="response"),
+                 outcome_label = test$y)
+logreg = logreg[order(logreg$predicted_probability_logit,decreasing=TRUE),]
+logreg$num_client= 1:nrow(logreg)
+logreg$precision = cumsum(logreg$y==1)/logreg$num_client
+
+logreg_plot <- logreg[which(logreg$num_client > 100),]
+
+plot_data <- cbind(logreg,rforest)
+
+r <- ggplot() +
+  # blue plot
+  geom_line(data=logreg_plot, aes(x=num_client, y=precision, colour="logistic")) +
+  # red plot
+  geom_line(data=rforest, aes(x=num_client, y=precision, colour="random forest")) +
+  scale_x_continuous('\nNumber of Restaurants') +
+  scale_y_continuous("Precision", limits=c(0, 1)) +
+  labs(color='') +
+  ggtitle("Precision-at-k of Logistic and Random Forest")
+r
+
+
+
+```
+
+
+## Discussion
+
+
+
+## Conclusion
+
+
+
+## Appendix
+
+
+### Checking convergence of multiple imputation procedure
+
+A cursory inspection of the $\hat{R}$ summary table shows mean (and standard deviation) values less than 1 across most  variables barring `cons.price.idx`. Using the more stringent criterion of evaluating convergence $\hat{R}$ < 1.0, the procedure can be considered mostly converged, that is, for both variables the difference of within and between variance of different chains of imputation is trivial.  The trace line plots illustrate a within and between divergence pattern of the generated imputation chain values that is consistent with the R-hats results.
+
+```{r convergence, message=FALSE,warning=FALSE,fig.align='center', echo=FALSE}
+mean_age = converged[, , 1]# 1. age
+mean_consumer.price.index = converged[, , 2] # 2. consumer price index
+
+# convergence diagnostics with chains and rhats ---------
+
+# rhats
+rhats <- Rhats(dat.imputations)
+rhats_table <- rhats  %>% 
+  as_tibble() %>%
+  add_column(variable = c("mean_age",
+                          "mean_cons.price.idx",
+                          "sd_age",
+                          "sd_cons.price.idx")) %>% 
+  dplyr::select(variable, value)
+
+# chains
+chain_table <- mipply(dat.imputations, mean, to.matrix = TRUE)
+
+# summary of rhats
+kable(rhats_table, padding = 2 , format = "markdown", caption = "R-Statistics of Within and Between Chain Imputation Values", digits = 3)
+
+
+# convergence plots of each of the 4 chains over 150 iterations across 
+
+# 1. Age
+ts.plot(mean_age[,1], col=1, main="Age", ylab = "mean")
+lines(mean_age[,2], col= 2)
+lines(mean_age[,3], col= 3)
+lines(mean_age[,4], col= 4)
+
+# 2. Consumer Price Index
+ts.plot(mean_consumer.price.index[,1], col=1, main="Consumer Price Index", ylab = "mean")
+lines(mean_consumer.price.index[,2], col= 2)
+lines(mean_consumer.price.index[,3], col= 3)
+lines(mean_consumer.price.index[,4], col= 4)
+
+```
+
+
+### EDA continued
+
+
+### Client Specific Attributes and Subscription to a Term Deposit
+
+We can start evaluating the relationship between client attributes and the outcome variable, subscription to a term deposit, by looking at the some barplots.
+
+```{r eda plots client specific, fig.align='center', echo=FALSE, warning=FALSE, message=FALSE}
+
+## Age distribution: mode of distribution for both y classes is around 30ish
+age.p <- ggplot(dat.compl, aes(age, fill = y)) +
+  geom_histogram(alpha = 0.5, position = "identity")
+age.p
+
+## Job type
+job.p <- ggplot(dat.compl, aes(factor(job),fill = factor(y)))
+job.p  <- job.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Job Type") + ylab("Count")
+
+job.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## marital status
+marital.p <- ggplot(dat.compl, aes(factor(marital),fill = factor(y)))
+marital.p  <- marital.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Marital Status") + ylab("Count")
+
+marital.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## education
+edu.p <- ggplot(dat.compl, aes(factor(education),fill = factor(y)))
+edu.p  <- edu.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Education level") + ylab("Count")
+
+edu.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## default
+
+default.p <- ggplot(dat.compl, aes(factor(default),fill = factor(y)))
+default.p <- default.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Client has credit in default?") + ylab("Count")
+
+default.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## housing
+
+
+housing.p <- ggplot(dat.compl, aes(factor(housing),fill = factor(y)))
+housing.p <- housing.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Client has housing loan?") + ylab("Count")
+
+housing.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+## loan
+loan.p <- ggplot(dat.compl, aes(factor(housing),fill = factor(y)))
+loan.p  <- loan.p   + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Client has personal loan?") + ylab("Count")
+
+loan.p  + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+### related with the last contact of the current campaign:
+
+#8 - contact: contact communication type (categorical: 'cellular','telephone') 
+contact.p <- ggplot(dat.compl, aes(factor(contact),fill = factor(y)))
+contact.p  <- contact.p  + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Contact communication type") + ylab("Count")
+
+contact.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+#9 - month: last contact month of year (categorical: 'jan', 'feb', 'mar', ..., 'nov', 'dec') 
+
+month.p <- ggplot(dat.compl, aes(factor(month),fill = factor(y)))
+month.p  <- month.p + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Last contact month of year") + ylab("Count")
+
+month.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+# 10 - day_of_week: last contact day of the week (categorical: 'mon','tue','wed','thu','fri')
+
+day.p <- ggplot(dat.compl, aes(factor(day_of_week),fill = factor(y)))
+day.p  <- day.p + geom_histogram(stat="count") +
+    ggtitle("") +
+  xlab("Last contact day of the week") + ylab("Count")
+
+day.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+```
+
+
+
+### Non-Client Specific Attributes and Subscription to a Term Deposit
+
+
+```{r eda plots non client specific, fig.align='center', echo=FALSE, warning=FALSE, message=FALSE}
+
+## 12 - campaign: number of contacts performed during this campaign and for this client (numeric, includes last contact) 
+
+camp.p <- ggplot(dat.compl, aes(campaign, fill = y)) +
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Number of contacts performed during this campaign and for this client") + 
+  ylab("Count")
+camp.p
+
+## 13 - pdays: number of days that passed by after the client was last contacted from a previous campaign (numeric; 999 means client was not previously contacted) 
+
+pdays.p <- ggplot(dat.compl, aes(factor(pdays.categ),fill = factor(y)))
+pdays.p  <- pdays.p   + geom_histogram(stat="count") +
+  ggtitle("") +
+  xlab("Number of days that passed by after the client was last contacted from a previous campaign") + 
+  ylab("Count")
+pdays.p  + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+
+## 14 - previous: number of contacts performed before this campaign and for this client (numeric) 
+
+prev.p <- ggplot(dat.compl, aes(previous,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Number of contacts performed during this campaign and for this client") + 
+  ylab("Count")
+
+prev.p
+
+## 15 - poutcome: outcome of the previous marketing campaign (categorical: 'failure','nonexistent','success')
+
+
+poutcome.p <- ggplot(dat.compl, aes(factor(poutcome),fill = factor(y)))
+poutcome.p  <- poutcome.p  + geom_histogram(stat="count", position = position_dodge()) +
+  ggtitle("") +
+  xlab("Outcome of the previous marketing campaign") + 
+  ylab("Count")
+poutcome.p + theme(axis.text.x = element_text(angle=45, hjust=1, vjust = 1),
+         plot.margin = margin(t = 20, r = 10, b = 10, l = 10))
+
+
+### social and economic context attributes ---
+
+## 16 - emp.var.rate: employment variation rate - quarterly indicator (numeric) 
+empvr.p <- ggplot(dat.compl, aes(emp.var.rate,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Employment variation rate") + 
+  ylab("Count")
+
+empvr.p 
+
+## 17 - cons.price.idx: consumer price index - monthly indicator (numeric) 
+
+cons.price.p <- ggplot(dat.compl, aes(cons.price.idx,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Consumer Price Index") + 
+  ylab("Count")
+
+cons.price.p
+
+## 18 - cons.conf.idx: consumer confidence index - monthly indicator (numeric) 
+
+cons.conf.p <- ggplot(dat.compl, aes(cons.conf.idx,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("Consumer confidence index") + 
+  ylab("Count")
+
+cons.conf.p 
+
+## 19 - euribor3m: euribor 3 month rate - daily indicator (numeric) 
+
+euribor3m.p <- ggplot(dat.compl, aes(euribor3m,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("euribor 3 month rate") + 
+  ylab("Count")
+
+euribor3m.p  
+
+## 20 - nr.employed: number of employees - quarterly indicator (numeric)
+
+nr.employed.p <- ggplot(dat.compl, aes(nr.employed,fill = factor(y))) + 
+  geom_histogram(alpha = 0.8, position = "identity") +
+  ggtitle("") +
+  xlab("number of employees") + 
+  ylab("Count")
+
+nr.employed.p
+
+```
+
